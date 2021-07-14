@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""
+Check for monitoring status and age of Elasticsearch snapshots
+
+MIT License
+
+Copyright (c) 2019 Lee Clemens
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+## Changelog:
+### 1.0 (initial) - Lee Clemens
+###    * built initial version
+### 1.1 - 04.05.2021 - Steven Schlegel
+###    * fixed basicauth handling
+###    * added args for basicauth digest
+###    * added digest authentication
+###    * fixed various snapshot checks
+
+
+import argparse
+import sys
+import time
+import traceback
+
+import requests
+
+STATUS_OK = 0
+STATUS_WARNING = 1
+STATUS_CRITICAL = 2
+STATUS_UNKNOWN = 3
+
+PREFIXES = {
+    STATUS_OK: 'OK',
+    STATUS_WARNING: 'WARNING',
+    STATUS_CRITICAL: 'CRITICAL',
+    STATUS_UNKNOWN: 'UNKNOWN'
+}
+
+ES_SNAPSHOT_STATE_SUCCESS = 'SUCCESS'
+ES_SNAPSHOT_STATE_PARTIAL = 'PARTIAL'
+
+THRESHOLD_SUFFIX_MULTIPLIERS = {
+    'w': 7 * 24 * 60 * 60 * 1000,
+    'd': 24 * 60 * 60 * 1000,
+    'h': 60 * 60 * 1000,
+    'm': 60 * 1000,
+    's': 1000,
+}
+
+# suppress warning
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+def query(args, qry):
+    # pylint: disable=broad-except
+    try:
+        if (args.userauth):
+           from requests.auth import HTTPBasicAuth
+
+           req = requests.get('{}://{}:{}/{}{}'.format(args.scheme,
+                                                    args.server,
+                                                    args.port,
+                                                    args.subfolder,
+                                                    qry),
+                              verify=False, auth=HTTPBasicAuth(args.username, args.password))
+        elif (args.basicauth):
+           from requests.auth import HTTPBasicAuth
+
+           ### use BasicAuth header if set
+           authset = {
+               'Authorization': "Basic " + args.basicauth
+           }
+
+           req = requests.get('{}://{}:{}/{}{}'.format(args.scheme,
+                                                    args.server,
+                                                    args.port,
+                                                    args.subfolder,
+                                                    qry),
+                              verify=False, headers=authset)
+        else:
+           req = requests.get('{}://{}:{}/{}{}'.format(args.scheme,
+                                                    args.server,
+                                                    args.port,
+                                                    args.subfolder,
+                                                    qry),
+                              verify=False)
+        if req.status_code == 200:
+            return req.json()
+        print('Failed to query: {}://{}:{}/{}{}.'
+              ' Status Code: {}'.format(args.scheme,
+                                        args.server,
+                                        args.port,
+                                        args.subfolder,
+                                        qry,
+                                        req.status_code))
+    except requests.exceptions.ConnectionError as conn_error:
+        print('Connection Error: {}'.format(conn_error))
+    except Exception as exc:
+        print('Unhandled Exception: {}'.format(exc))
+    sys.exit(STATUS_CRITICAL)
+
+
+def check_status(args, newest_snapshot_time, now):
+    if now - newest_snapshot_time >= args.critical:
+        return STATUS_CRITICAL
+    if now - newest_snapshot_time >= args.warning:
+        return STATUS_WARNING
+    return STATUS_OK
+
+
+def check_repository_status(args, repository, now):
+    newest_snapshot_time = 0
+    newest_snapshot_name = None
+    newest_snapshot_date = None
+    for snapshot in query(
+            args,
+            '_snapshot/{}/_all'.format(repository))['snapshots']:
+        if ((snapshot['state'] == ES_SNAPSHOT_STATE_SUCCESS
+             or (args.allow_partial and snapshot['state'] == ES_SNAPSHOT_STATE_PARTIAL))
+                and snapshot['end_time_in_millis'] > newest_snapshot_time):
+            newest_snapshot_time = snapshot['end_time_in_millis']
+            newest_snapshot_name = snapshot['snapshot']
+            newest_snapshot_date = snapshot['end_time']
+    if newest_snapshot_name:
+        status = check_status(args, newest_snapshot_time, now)
+        return (status,
+                newest_snapshot_time,
+                newest_snapshot_name,
+                newest_snapshot_date)
+    print('No snapshots found in repository: {}'.format(repository))
+    return STATUS_UNKNOWN, None, None, None
+
+
+def run(args):
+    return_status = STATUS_OK
+    newest_repository = None
+    newest_snapshot_name = None
+    newest_snapshot_date = None
+    perf_newest_snapshot_millis = sys.maxsize
+    repositories = [args.repository] if args.repository else []
+    if not repositories:
+        for repository in query(args, '_snapshot/_all'):
+            repositories.append(repository)
+    now = time.time() * 1000
+    for repository in repositories:
+        (repo_status,
+         repo_newest_snapshot_millis,
+         repo_newest_snapshot_name,
+         repo_newest_snapshot_date) = check_repository_status(args,
+                                                              repository,
+                                                              now)
+        if repo_status > return_status:
+            return_status = repo_status
+        if (repo_newest_snapshot_millis is not None
+                and 0
+                < repo_newest_snapshot_millis
+                < perf_newest_snapshot_millis):
+            newest_repository = repository
+            perf_newest_snapshot_millis = repo_newest_snapshot_millis
+            newest_snapshot_name = repo_newest_snapshot_name
+            newest_snapshot_date = repo_newest_snapshot_date
+
+    exit_with_perf_data(newest_repository,
+                        newest_snapshot_name,
+                        newest_snapshot_date,
+                        now - perf_newest_snapshot_millis,
+                        return_status)
+
+
+def exit_with_perf_data(newest_repository,
+                        newest_snapshot_name,
+                        newest_snapshot_date,
+                        perf_newest_millis,
+                        exit_code):
+    perf_newest_seconds = perf_newest_millis / 1000
+    perf_newest_days = perf_newest_seconds / 60 / 60 / 24
+    output_str = (
+        '{} - Most current Repository/Snapshot: {}/{} {}'.format(
+            PREFIXES[exit_code],
+            newest_repository,
+            newest_snapshot_name,
+            newest_snapshot_date))
+    if newest_snapshot_name:
+        output_str += ' | newest_age_seconds={} newest_age_days={}'.format(
+            perf_newest_seconds,
+            perf_newest_days)
+    print(output_str)
+    sys.exit(exit_code)
+
+
+def parse_threshold(threshold):
+    """ Returns milliseconds to use for threshold.
+    Calculates time based on supported suffixes unless value is purely numerical.
+    """
+    try:
+        return float(threshold)
+    except ValueError:
+        try:
+            raw_millis = float(threshold[:-1])
+            suffix = threshold[-1]
+            if suffix in THRESHOLD_SUFFIX_MULTIPLIERS:
+                return raw_millis * THRESHOLD_SUFFIX_MULTIPLIERS[suffix]
+            print('Unexpected duration in threshold: {}.'
+                  ' Complete threshold: {}'.format(suffix, threshold))
+            sys.exit(STATUS_CRITICAL)
+        except ValueError:
+            print('Invalid warning or critical threshold: {}'.format(threshold))
+            sys.exit(STATUS_CRITICAL)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        'This plugin checks the Elasticsearch snapshots for either all'
+        ' or a specific repository. It will test the age'
+        ' of any successful snapshot, using the newest in each repository.')
+    parser.add_argument('-m', '--scheme', type=str,
+                        required=False,
+                        dest='scheme',
+                        default='http',
+                        help='scheme (http/https defaults to http)')
+    parser.add_argument('-s', '--server', type=str,
+                        required=True,
+                        dest='server',
+                        help='server')
+    parser.add_argument('-p', '--port', type=int,
+                        required=True,
+                        dest='port',
+                        help='port')
+    parser.add_argument('--userauth', type=str,
+                        required=False,
+                        dest='userauth',
+                        default=None,
+                        help='userauth')
+    parser.add_argument('--basicauth', type=str,
+                        required=False,
+                        dest='basicauth',
+                        default=None,
+                        help='basicauth')
+    parser.add_argument('--username', type=str,
+                        required=False,
+                        dest='username',
+                        default=None,
+                        help='username')
+    parser.add_argument('--password', type=str,
+                        required=False,
+                        dest='password',
+                        default=None,
+                        help='password')
+    parser.add_argument('--subfolder', type=str,
+                        required=False,
+                        dest='subfolder',
+                        default='',
+                        help='subfolder')
+    parser.add_argument('-w', '--warning', type=str,
+                        dest='warning',
+                        required=True,
+                        help='warning time (ms or suffixed with {s,m,h,d,w})')
+    parser.add_argument('-c', '--critical', type=str,
+                        dest='critical',
+                        required=True,
+                        help='critical time (ms or suffixed with {s,m,h,d,w})')
+    parser.add_argument('-r', '--repository', type=str,
+                        dest='repository',
+                        default=None,
+                        required=False,
+                        help='repository')
+    parser.add_argument('--allow-partial',
+                        dest='allow_partial',
+                        default=False,
+                        required=False,
+                        action='store_true',
+                        help=('Treat %s snapshots as %s'
+                              % (ES_SNAPSHOT_STATE_PARTIAL,
+                                 ES_SNAPSHOT_STATE_SUCCESS)))
+    args = parser.parse_args()
+    args.warning = parse_threshold(str(args.warning))
+    args.critical = parse_threshold(str(args.critical))
+    if args.warning > args.critical:
+        print('Warning must be less than critical')
+        sys.exit(STATUS_CRITICAL)
+    if args.subfolder and not args.subfolder.endswith('/'):
+        args.subfolder += '/'
+    return args
+
+
+if __name__ == '__main__':
+    try:
+        run(parse_args())
+    # pylint: disable=broad-except
+    except Exception as ex:
+        print('%s: Unhandled exception %s' % (sys.argv[0], type(ex)))
+        print(ex)
+        traceback.print_exc()
+        sys.exit(STATUS_CRITICAL)
